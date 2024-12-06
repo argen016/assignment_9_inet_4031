@@ -1,0 +1,805 @@
+Tyler Argent
+INET 4031
+11/01/2024
+Assignment 9
+Part 1:
+tyler@tyler-ubuntu:~$ which adduser
+/usr/sbin/adduser
+tyler@tyler-ubuntu:~$ more /usr/sbin/adduser
+#! /usr/bin/perl
+# Copyright (C) 2000-2004 Roland Bauerschmidt <rb@debian.org>
+# 2005-2023 Marc Haber <mh+debian-packages@zugschlus.de>
+# 2022 Benjamin Drung <benjamin.drung@canonical.com>
+# 2023 Guillem Jover <guillem@debian.org>
+# 2021-2022 Jason Franklin <jason@oneway.dev>
+# 2022 Matt Barry <matt@hazelmollusk.org>
+# 2016-2017 Afif Elghraoui <afif@debian.org>
+# 2016 Dr. Helge Kreutzmann <debian@helgefjell.de>
+# 2005-2009 Joerg Hoh <joerg@joerghoh.de>
+# 2006-2011 Stephen Gran <sgran@debian.org>
+#
+# Original adduser:
+# Copyright (C) 1997-1999 Guy Maor <maor@debian.org>
+#
+# Copyright (C) 1995 Ted Hajek <tedhajek@boombox.micro.umn.edu>
+# Ian A. Murdock <imurdock@gnu.ai.mit.edu>
+#
+# The general scheme of this program was adapted from the original
+# Debian "adduser" program by Ian A. Murdock <imurdock@gnu.ai.mit.edu>.
+#
+# License: GPL-2+
+use 5.32.0;
+use strict;
+use warnings;
+use Getopt::Long;
+use Debian::AdduserCommon 3.136;
+use Debian::AdduserLogging 3.136;
+use Debian::AdduserRetvalues 3.136;
+BEGIN {
+if ( Debian::AdduserCommon->VERSION != version->declare('3.136') ||
+Debian::AdduserLogging->VERSION != version->declare('3.136') ||
+Debian::AdduserRetvalues->VERSION != version->declare('3.136') ) {
+die "wrong module version in adduser, check your packaging or path";
+}
+}
+my $version = "3.137ubuntu1";
+BEGIN {
+local $ENV{PERL_DL_NONLAZY}=1;
+# we need to disable perlcritic here since this construct
+# needs experession form eval, see perl cookbook 12.2.3
+## no critic
+eval "
+require POSIX;
+import POSIX qw(setlocale);
+";
+## use critic
+if ($@) {
+*setlocale = sub { return 1 };
+} else {
+setlocale( &POSIX::LC_MESSAGES, "" );
+}
+## no critic
+eval "
+require I18N::Langinfo;
+import I18N::Langinfo qw(langinfo YESEXPR NOEXPR);
+";
+## use critic
+if ($@) {
+*langinfo = sub { return shift; };
+*YESEXPR = sub { "^[yY]" };
+*NOEXPR = sub { "^[nN]" };
+}
+}
+my $yesexpr = langinfo(YESEXPR());
+my %config; # configuration hash
+my $nogroup_id = getgrnam("nogroup") || 65534;
+$0 =~ s+.*/++;
+our $verbose = 1; # should we be verbose?
+my $name_check_level = 0; # should we allow bad names?
+our $stderrmsglevel = "warn";
+our $stdoutmsglevel = "info";
+our $logmsglevel = "info";
+my $allow_badname = 0; # should we allow bad names?
+my $ask_passwd = 1; # ask for a passwd?
+my $disabled_login = 0; # leave the new account disabled?
+our @configfiles;
+our @defaults = undef;
+our $encrypt_home = undef;
+our $found_group_opt = undef;
+our $found_sys_opt = undef;
+our $ingroup_name = undef;
+our $new_firstgid = undef;
+our $new_firstuid = undef;
+our $new_comment = undef;
+our $gid_option = undef;
+our $primary_gid = undef;
+our $new_lastgid = undef;
+our $new_lastuid = undef;
+our $new_uid = undef;
+our $no_create_home = undef;
+our $special_home = undef;
+our $special_shell = undef;
+our $use_extrausers = 0;
+our $add_extra_groups;
+our $add_extra_groups_old;
+# Global variables we need later
+my $existing_user = undef;
+my $existing_group = undef;
+my $new_name = undef;
+my $make_group_also = 0;
+my $home_dir = undef;
+my $undohome = undef;
+my $undouser = undef;
+my $undogroup = undef;
+my $shell = undef;
+my $first_uid = undef;
+my $last_uid = undef;
+my $first_gid = undef;
+my $last_gid = undef;
+my $dir_mode = undef;
+my $perm = undef;
+my %uid_pool;
+my %gid_pool;
+our @names;
+GetOptions(
+'add-extra-groups' => \$add_extra_groups,
+'add_extra_groups' => \$add_extra_groups_old,
+'allow-all-names' => sub { $name_check_level = 2 },
+'allow-badname' => sub { $name_check_level = 1 unless $name_check_level },
+'allow-bad-names' => sub { $name_check_level = 1 unless $name_check_level },
+'comment=s' => \$new_comment,
+'conf|c=s' => \@configfiles,
+'debug' => sub { $verbose = 2 },
+'stdoutmsglevel=s' => \$stdoutmsglevel,
+'stderrmsglevel=s' => \$stderrmsglevel,
+'logmsglevel=s' => \$logmsglevel,
+'disabled-login' => sub { $disabled_login = 1; $ask_passwd = 0 },
+'disabled-password' => sub { $ask_passwd = 0 },
+'encrypt-home' => \$encrypt_home,
+'extrausers' => \$use_extrausers,
+'firstgid=i' => \$new_firstgid,
+'firstuid=i' => \$new_firstuid,
+'force-badname' => sub { $name_check_level = 1 unless $name_check_level },
+'gecos=s' => \$new_comment,
+'gid=i' => \$gid_option,
+'group' => \$found_group_opt,
+'help|h' => sub { &usage; exit },
+'home=s' => \$special_home,
+'ingroup=s' => \$ingroup_name,
+'lastgid=i' => \$new_lastgid,
+'lastuid=i' => \$new_lastuid,
+'no-create-home' => \$no_create_home,
+'quiet|q' => sub { $verbose = 0 },
+'shell=s' => \$special_shell,
+'system' => \$found_sys_opt,
+'uid=i' => \$new_uid,
+'verbose' => sub { $verbose = 1 },
+'version|v' => sub { &version; exit },
+) or &usage_error;
+if(!@configfiles) {
+@defaults = ("/etc/adduser.conf");
+} else {
+@defaults = (@configfiles);
+}
+# preseed configuration data and then read the config file
+preseed_config(\@defaults,\%config);
+# everyone can issue "--help" and "--version", but only root can go on
+if( $> != 0) {
+log_fatal( mtx("Only root may add a user or group to the system.") );
+exit( RET_ROOT_NEEDED );
+}
+# TODO: Handle configuration file input, allow bare input there.
+if( $verbose == 0 ) {
+set_msglevel( $stderrmsglevel, "warn", $logmsglevel );
+} elsif( $verbose == 1 ) {
+set_msglevel( $stderrmsglevel, "info", $logmsglevel );
+} elsif( $verbose == 2 ) {
+set_msglevel( $stderrmsglevel, "debug", $logmsglevel );
+} else {
+set_msglevel( $stderrmsglevel, $stdoutmsglevel, $logmsglevel );
+}
+# detect the right mode
+my $action = $0 eq "addgroup" ? "addgroup" : "adduser";
+if (defined($found_sys_opt)) {
+$action = "addsysuser" if ($action eq "adduser");
+$action = "addsysgroup" if ($action eq "addgroup");
+}
+# explicitly set PATH, because super (1) cleans up the path and makes adduser unusable;
+# this is also a good idea for sudo (which doesn't clean up)
+$ENV{"PATH"}="/bin:/usr/bin:/sbin:/usr/sbin";
+$ENV{"IFS"}=" \t\n";
+############################
+# checks related to @names #
+############################
+while (defined(my $arg = shift(@ARGV))) {
+push (@names, $arg);
+}
+if ( (! defined $names[0]) || length($names[0]) == 0 || @names > 2) {
+log_fatal( mtx("Only one or two names allowed.") );
+exit( RET_INVALID_CALL );
+}
+if (@names == 2) { # must be addusertogroup
+if ($action eq "addsysuser" || $found_group_opt) {
+log_fatal( mtx("Specify only one name in this mode.") );
+exit( RET_INVALID_CALL );
+}
+if ($action eq "addgroup" or $action eq "addsysgroup") {
+log_fatal( mtx("addgroup with two arguments is an unspecified operation.") );
+exit( RET_INVALID_CALL );
+}
+$action = "addusertogroup";
+$existing_user = shift (@names);
+$existing_group = shift (@names);
+}
+else { # 1 parameter, must be adduser
+$new_name = shift (@names);
+}
+###################################
+# check for consistent parameters #
+###################################
+if (!defined $add_extra_groups) {
+if( defined $add_extra_groups_old ) {
+$add_extra_groups = $add_extra_groups_old;
+} else {
+$add_extra_groups = 0;
+}
+}
+if ($action ne "addgroup" &&
+defined($found_group_opt) +defined($ingroup_name) +defined($gid_option) > 1 ) {
+log_fatal( mtx("The --group, --ingroup, and --gid options are mutually exclusive.")
+);
+exit( RET_EXCLUSIVE_PARAMETERS );
+}
+if ((defined($special_home)) && ($special_home !~ m+^/+ )) {
+log_fatal( mtx("The home dir must be an absolute path.") );
+exit( RET_INVALID_HOME_DIRECTORY );
+}
+if (defined($special_home)) {
+if (!defined($no_create_home) && -d $special_home) {
+log_info( mtx("The home dir %s you specified already exists.\n"), $special_home
+);
+}
+if (defined($no_create_home) && ! -d $special_home) {
+log_info( mtx("The home dir %s you specified can't be accessed: %s\n"), $special
+_home, $! );
+}
+}
+if ($found_group_opt) {
+if ($action eq "addsysuser") {
+$make_group_also = 1;
+}
+elsif ($found_sys_opt) {
+$action = "addsysgroup";
+}
+else {
+$action = "addgroup";
+}
+}
+my $ecryptfs_setup_private;
+if (defined($encrypt_home)) {
+$ecryptfs_setup_private = &which('ecryptfs-setup-private');
+}
+# TODO: map this to log levels
+$ENV{"VERBOSE"} = $verbose;
+$ENV{"DEBUG"} = $verbose;
+# preseed_config was moved from here
+# read the uid and gid pool
+if ($config{"uid_pool"}) {
+read_pool ($config{"uid_pool"}, "uid", \%uid_pool);
+}
+if ($config{"gid_pool"}) {
+read_pool ($config{"gid_pool"}, "gid", \%gid_pool);
+}
+&checkname($new_name) if defined $new_name;
+$SIG{'INT'} = $SIG{'QUIT'} = $SIG{'HUP'} = 'handler';
+#####
+# OK, we've processed the arguments. $action equals one of the following,
+# and the appropriate variables have been set:
+#
+# $action = "adduser"
+# $new_name - the name of the new user.
+# $ingroup_name | $gid_option - the group to add the user to
+# $special_home, $new_uid, $new_comment - optional overrides
+# $action = "addgroup"
+# $new_name - the name of the new group
+# $gid_option - optional override
+# $action = "addsysgroup"
+# $new_name - the name of the new group
+# $gid_option - optional override
+# $action = "addsysuser"
+# $new_name - the name of the new user
+# $make_group_also | $ingroup_name | $gid_option | 0 - which group
+# $special_home, $new_uid, $new_comment - optional overrides
+# $action = "addusertogroup"
+# $existing_user - the user to be added
+# $existing_group - the group to add her to
+#####
+#################
+## addsysgroup ##
+#################
+if ($action eq "addsysgroup") {
+acquire_lock();
+# Check if requested group already exists and we can exit safely
+my $ret = existing_group_ok($new_name, $gid_option);
+if ($ret == 3) {
+log_info( mtx("The group `%s' already exists as a system group. Exiting."), $new
+_name );
+exit( RET_OK );
+}
+if ($ret == 1) {
+log_err( mtx("The group `%s' already exists and is not a system group. Exiting."
+), $new_name );
+exit( RET_WRONG_OBJECT_PROPERTIES );
+}
+if ($ret == 2) {
+log_err( mtx("The group `%s' already exists, but has a different GID. Exiting.")
+, $new_name );
+exit( RET_WRONG_OBJECT_PROPERTIES );
+}
+if (defined($gid_option) && defined(getgrgid($gid_option))) {
+log_fatal( mtx("The GID `%s' is already in use."), $gid_option );
+exit( RET_ID_IN_USE );
+}
+if (!defined($gid_option)) {
+$first_gid = $new_firstgid || $config{"first_system_gid"};
+$last_gid = $new_lastgid || $config{"last_system_gid"};
+$gid_option = &first_avail_gid($first_gid,
+$last_gid,
+$gid_pool{$new_name}{'id'});
+if ($gid_option == -1) {
+log_warn( mtx("No GID is available in the range %d-%d (FIRST_SYS_GID - LAST_
+SYS_GID)."),
+$first_gid, $last_gid );
+log_err( mtx("The group `%s' was not created."), $new_name );
+exit( RET_NO_ID_IN_RANGE );
+}
+}
+log_info( mtx("Adding group `%s' (GID %d) ..."), $new_name, $gid_option);
+my $groupadd = &which('groupadd');
+if ( ($use_extrausers) || ($config{"use_extrausers"}) ) {
+&systemcall($groupadd, '--extrausers', '-g', $gid_option, $new_name);
+} else {
+&systemcall($groupadd, '-g', $gid_option, $new_name);
+}
+release_lock(0);
+exit( RET_OK );
+}
+##############
+## addgroup ##
+##############
+if ($action eq "addgroup") {
+acquire_lock();
+if (defined getgrnam($new_name)) {
+log_fatal( mtx("The group `%s' already exists."), $new_name);
+exit( RET_OBJECT_EXISTS );
+}
+if (defined($gid_option) && defined(getgrgid($gid_option))) {
+log_fatal( mtx("The GID `%s' is already in use."), $gid_option );
+exit( RET_ID_IN_USE );
+}
+if (!defined($gid_option)) {
+$first_gid = $new_firstgid || $config{"first_gid"};
+$last_gid = $new_lastgid || $config{"last_gid"};
+log_debug( "Searching for gid with first_gid=%s, last_gid=%s, new_name=%s, gid_p
+ool=%s",
+$first_gid,
+$last_gid,
+$new_name,
+$gid_pool{$new_name}{'id'}
+);
+$gid_option = &first_avail_gid($first_gid,
+$last_gid,
+$gid_pool{$new_name}{'id'});
+if ($gid_option == -1) {
+log_warn( mtx("No GID is available in the range %d-%d (FIRST_GID - LAST_GID)
+."),
+$first_gid, $last_gid );
+log_fatal( mtx("The group `%s' was not created."), $new_name );
+exit( RET_NO_ID_IN_RANGE );
+}
+}
+log_info( mtx("Adding group `%s' (GID %d) ..."), $new_name, $gid_option);
+my $groupadd = &which('groupadd');
+if ( ($use_extrausers) || ($config{"use_extrausers"}) ) {
+&systemcall($groupadd, '--extrausers', '-g', $gid_option, $new_name);
+} else {
+&systemcall($groupadd, '-g', $gid_option, $new_name);
+}
+release_lock(0);
+exit( RET_OK );
+}
+####################
+## addusertogroup ##
+####################
+if ($action eq 'addusertogroup') {
+if (!defined getpwnam($existing_user)) {
+log_fatal( mtx("The user `%s' does not exist."), $existing_user );
+exit( RET_OBJECT_DOES_NOT_EXIST );
+}
+if (!defined getgrnam($existing_group)) {
+log_fatal( mtx("The group `%s' does not exist."), $existing_group );
+exit( RET_OBJECT_DOES_NOT_EXIST );
+}
+if (&user_is_member($existing_user, $existing_group)) {
+log_info( mtx("The user `%s' is already a member of `%s'."), $existing_user, $ex
+isting_group );
+exit( RET_OK );
+}
+log_info( mtx("Adding user `%s' to group `%s' ..."), $existing_user, $existing_group
+);
+acquire_lock();
+if ( ($use_extrausers) || ($config{"use_extrausers"}) ) {
+&systemcall('/usr/sbin/usermod', '--extrausers', '-a', '-G', $existing_group, $e
+xisting_user);
+} else {
+&systemcall('/usr/sbin/usermod', '-a', '-G', $existing_group, $existing_user);
+}
+release_lock();
+exit( RET_OK );
+}
+################
+## addsysuser ##
+################
+if ($action eq "addsysuser") {
+acquire_lock();
+if (existing_user_ok($new_name, $new_uid) == 1) {
+# a user with this name already exists; it's a problem when it's not a system us
+er
+my $tmp_u = getpwnam($new_name);
+if (($tmp_u >= $config{"first_system_uid"}) and ($tmp_u <= $config{"last_system_
+uid"})) {
+log_info( mtx("The system user `%s' already exists. Exiting.\n"), $new_name
+);
+exit( RET_OK );
+}
+log_fatal( mtx("The user `%s' already exists, but is not a system user. Exiting.
+"), $new_name );
+exit( RET_WRONG_OBJECT_PROPERTIES );
+}
+if (existing_user_ok($new_name, $new_uid) == 2) {
+log_fatal( mtx("The user `%s' already exists with a different UID. Exiting."), $
+new_name );
+exit( RET_WRONG_OBJECT_PROPERTIES );
+}
+if (!$ingroup_name && !defined($gid_option) && !$make_group_also) {
+$gid_option = $nogroup_id;
+}
+check_user_group(1);
+if (!defined($new_uid) && $make_group_also) {
+$new_uid = &first_avail_uid($new_firstuid || $config{"first_system_uid"},
+$new_lastuid || $config{"last_system_uid"},
+$uid_pool{$new_name}{'id'});
+if ($new_uid == -1) {
+log_warn( mtx("No UID/GID pair is available in the range %d-%d (FIRST_SYS_UI
+D - LAST_SYS_UID)."),
+$config{"first_system_uid"},
+$config{"last_system_uid"} );
+log_fatal( mtx("The user `%s' was not created."), $new_name );
+exit( RET_NO_ID_IN_RANGE );
+}
+$gid_option = &first_avail_gid($new_firstgid || $config{"first_system_gid"},
+$new_lastgid || $config{"last_system_gid"},
+$gid_pool{$new_name}{'id'});
+$ingroup_name = $new_name;
+}
+elsif (!defined($new_uid) && !$make_group_also) {
+$new_uid = &first_avail_uid($new_firstuid || $config{"first_system_uid"},
+$new_lastuid || $config{"last_system_uid"},
+$uid_pool{$new_name}{'id'});
+if ($new_uid == -1) {
+log_warn( mtx("No UID is available in the range %d-%d (FIRST_SYS_UID - LAST_
+SYS_UID)."),
+$config{"first_system_uid"},
+$config{"last_system_uid"} );
+log_fatal( mtx("The user `%s' was not created."), $new_name);
+exit( RET_NO_ID_IN_RANGE );
+}
+if (defined($gid_option)) {
+$ingroup_name = getgrgid($gid_option);
+} elsif ($ingroup_name) {
+$gid_option = getgrnam($ingroup_name);
+} else {
+log_fatal( mtx("Neither ingroup option nor gid given.") );
+exit( RET_NO_PRIMARY_GROUP );
+}
+}
+else {
+if (defined($gid_option)) {
+$ingroup_name = getgrgid($gid_option);
+} elsif ($ingroup_name) {
+$gid_option = getgrnam($ingroup_name);
+} elsif ($make_group_also) {
+$gid_option=$new_uid; $ingroup_name=$new_name;
+} else {
+log_fatal( mtx("Neither ingroup option nor gid given and make_group_also uns
+et.") );
+exit( RET_NO_PRIMARY_GROUP );
+}
+}
+log_info( mtx("Adding system user `%s' (UID %d) ..."), $new_name, $new_uid );
+# if we reach this point, and the group does already exist, we can use it.
+if ($make_group_also && !getgrnam($new_name)) {
+log_info( mtx("Adding new group `%s' (GID %d) ..."), $new_name, $gid_option );
+$undogroup = $new_name;
+my $groupadd = &which('groupadd');
+if ( ($use_extrausers) || ($config{"use_extrausers"}) ) {
+&systemcall($groupadd, '--extrausers', '-g', $gid_option, $new_name);
+} else {
+&systemcall($groupadd, '-g', $gid_option, $new_name);
+}
+}
+log_info( mtx("Adding new user `%s' (UID %d) with group `%s' ..."),
+$new_name, $new_uid, $ingroup_name );
+$home_dir = $special_home || $uid_pool{$new_name}{'home'} || '/nonexistent';
+$no_create_home = $home_dir =~ /^\/+nonexistent(\/|$)/ ? 1 : $no_create_home;
+$shell = $special_shell || $uid_pool{$new_name}{'shell'} || '/usr/sbin/nologin';
+$undouser = $new_name;
+if ( ($use_extrausers) || ($config{"use_extrausers"}) ) {
+&systemcall('/usr/sbin/useradd', '--extrausers', '-r',
+'-K', sprintf('SYS_UID_MIN=%d', $config{'first_system_uid'}),
+'-K', sprintf('SYS_UID_MAX=%d', $config{'last_system_uid'}),
+'-d', $home_dir,
+'-g', $ingroup_name,
+'-s', $shell,
+'-u', $new_uid,
+$new_name);
+} else {
+&systemcall('/usr/sbin/useradd', '-r',
+'-K', sprintf('SYS_UID_MIN=%d', $config{'first_system_uid'}),
+'-K', sprintf('SYS_UID_MAX=%d', $config{'last_system_uid'}),
+'-d', $home_dir,
+'-g', $ingroup_name,
+'-s', $shell,
+'-u', $new_uid,
+$new_name);
+}
+release_lock(0);
+if (defined($new_comment)) {
+&ch_comment($new_comment);
+} elsif ($uid_pool{$new_name}{'comment'}) {
+&ch_comment($uid_pool{$new_name}{'comment'});
+}
+$primary_gid = $gid_option;
+create_homedir(0);
+exit( RET_OK );
+}
+#############
+## adduser ##
+#############
+if ($action eq "adduser") {
+acquire_lock();
+$primary_gid=-1;
+my @supplemental_groups=();
+log_trace( "new_uid %s", $new_uid );
+log_trace( "ingroup_name %s, gid_option %s", $ingroup_name, $gid_option );
+log_trace( "usergroups %s", $config{"usergroups"} );
+log_trace( "users_gid %s, users_group %s", $config{"users_gid"}, $config{"users_grou
+p"} );
+log_trace( "primary_gid %s, supplemental groups %s", $primary_gid, join(", ",@supple
+mental_groups) );
+if( defined($config{"users_gid"}) && defined($config{"users_group"}) ) {
+log_warn ( mtx("USERS_GID and USERS_GROUP both given in configuration. This is a
+n error.") );
+log_fatal (mtx("The user `%s' was not created."),$new_name);
+exit( RET_CONFIG_ERROR );
+}
+if ($config{"usergroups"} =~ /yes/i) {
+log_trace( "config usergroups == yes code path" );
+$make_group_also = 1;
+if( $gid_option ) {
+$make_group_also = 0;
+$primary_gid = $gid_option;
+log_trace( "gid_option defined %s, make_group_also 0, primary_gid=gid_option
+", $gid_option );
+}
+if( $ingroup_name ) {
+$make_group_also = 0;
+$primary_gid = getgrnam($ingroup_name);
+log_trace( "ingroup_name defined %s, make_group_also 0, primary_gid %s", $gi
+d_option, $primary_gid );
+}
+log_trace( "make_group_also %s, primary_gid %s", $make_group_also, $primary_gid
+);
+if( defined( $primary_gid) && $primary_gid == -1 && $make_group_also == 0 ) {
+if (defined($config{"users_gid"}) && $config{"users_gid"} != -1) {
+my @grgid=getgrgid($config{"users_gid"});
+my $grname=$grgid[0];
+log_debug( "set primary_gid to users_gid %s %s", $config{"users_gid"}, $
+grname);
+$primary_gid = $config{"users_gid"};
+} elsif (defined($config{"users_gid"}) && $config{"users_gid"} == -1) {
+# nothing
+} else {
+my $primary_group="users";
+if (defined($config{"users_group"})) {
+$primary_group=$config{"users_group"};
+}
+$primary_gid=getgrnam($primary_group);
+log_debug( "set primary_gid to users_group %s %s", $primary_gid, $primar
+y_group);
+}
+} else {
+if (defined($config{"users_gid"}) && $config{"users_gid"} != -1) {
+my @grgid=getgrgid($config{"users_gid"});
+my $grname=$grgid[0];
+log_trace( "push users_gid %s %s to supplemental_groups", $config{"users
+_gid"}, $grname);
+push(@supplemental_groups, $grname);
+} elsif (defined($config{"users_gid"}) && $config{"users_gid"} == -1) {
+# nothing
+} else {
+my $supp_group="users";
+if (defined($config{"users_group"})) {
+$supp_group=$config{"users_group"};
+}
+log_trace( "push %s to supplemental_groups", $supp_group );
+push(@supplemental_groups, $supp_group);
+}
+}
+} else {
+log_debug( "config usergroups != yes code path" );
+if( defined($ingroup_name) ) {
+$primary_gid=getgrnam($ingroup_name);
+} elsif (defined($config{"users_gid"})) {
+log_trace( "primary_gid = users_gid = %d", $primary_gid );
+tyler@tyler-ubuntu:~$ sudo adduser user01
+[sudo] password for tyler:
+info: Adding user `user01' ...
+info: Selecting UID/GID from range 1000 to 59999 ...
+info: Adding new group `user01' (1001) ...
+info: Adding new user `user01' (1001) with group `user01 (1001)' ...
+info: Creating home directory `/home/user01' ...
+info: Copying files from `/etc/skel' ...
+New password:
+Retype new password:
+passwd: password updated successfully
+Changing the user information for user01
+Enter the new value, or press ENTER for the default
+Full Name []: Tyler
+Room Number []: Room-111
+Work Phone []: 111-1234
+Home Phone []: 111-5678
+Other []: Other
+Is the information correct? [Y/n] y
+info: Adding new user `user01' to supplemental / extra groups `users' ...
+info: Adding user `user01' to group `users' ...
+tyler@tyler-ubuntu:~$ grep user01 /etc/passwd
+user01:x:1001:1001:Tyler,Room-111,111-1234,111-5678,Other:/home/user01:/bin/bash
+tyler@tyler-ubuntu:~$ ls /home
+tyler user01
+ssh user01@localhost
+The authenticity of host 'localhost (127.0.0.1)' can't be established.
+ED25519 key fingerprint is SHA256:YxxegLWlgG5fa2ds15XjxoIOKWgmyQU+kKShekrT4G0.
+This key is not known by any other names.
+Are you sure you want to continue connecting (yes/no/[fingerprint])? yes
+Warning: Permanently added 'localhost' (ED25519) to the list of known hosts.
+user01@localhost's password:
+Welcome to Ubuntu 24.04.1 LTS (GNU/Linux 6.8.0-47-generic aarch64)
+* Documentation: https://help.ubuntu.com
+* Management: https://landscape.canonical.com
+* Support: https://ubuntu.com/pro
+System information as of Fri Nov 1 07:09:58 PM UTC 2024
+System load: 0.0 Temperature: 11758.9 C
+Usage of /: 57.5% of 9.75GB Processes: 220
+Memory usage: 11% Users logged in: 1
+Swap usage: 0% IPv4 address for ens160: 172.16.53.130
+Expanded Security Maintenance for Applications is not enabled.
+36 updates can be applied immediately.
+To see these additional updates run: apt list --upgradable
+Enable ESM Apps to receive additional future security updates.
+See https://ubuntu.com/esm or run: sudo pro status
+The programs included with the Ubuntu system are free software;
+the exact distribution terms for each program are described in the
+individual files in /usr/share/doc/*/copyright.
+Ubuntu comes with ABSOLUTELY NO WARRANTY, to the extent permitted by
+applicable law.
+user01@tyler-ubuntu:~$ id
+uid=1001(user01) gid=1001(user01) groups=1001(user01),100(users)
+user01@tyler-ubuntu:~$ exit
+logout
+Connection to localhost closed.
+tyler@tyler-ubuntu:~$ sudo adduser user02
+info: Adding user `user02' ...
+info: Selecting UID/GID from range 1000 to 59999 ...
+info: Adding new group `user02' (1002) ...
+info: Adding new user `user02' (1002) with group `user02 (1002)' ...
+info: Creating home directory `/home/user02' ...
+info: Copying files from `/etc/skel' ...
+New password:
+Retype new password:
+passwd: password updated successfully
+Changing the user information for user02
+Enter the new value, or press ENTER for the default
+Full Name []: Tyler B
+Room Number []: 111
+Work Phone []: 112
+Home Phone []: 113
+Other []: other
+Is the information correct? [Y/n] y
+info: Adding new user `user02' to supplemental / extra groups `users' ...
+info: Adding user `user02' to group `users' ...
+tyler@tyler-ubuntu:~$ sudo adduser user03
+info: Adding user `user03' ...
+info: Selecting UID/GID from range 1000 to 59999 ...
+info: Adding new group `user03' (1003) ...
+info: Adding new user `user03' (1003) with group `user03 (1003)' ...
+info: Creating home directory `/home/user03' ...
+info: Copying files from `/etc/skel' ...
+New password:
+Retype new password:
+passwd: password updated successfully
+Changing the user information for user03
+Enter the new value, or press ENTER for the default
+Full Name []: tyler c
+Room Number []: 111
+Work Phone []: 112
+Home Phone []: 113
+Other []: other
+Is the information correct? [Y/n] y
+info: Adding new user `user03' to supplemental / extra groups `users' ...
+info: Adding user `user03' to group `users' ...
+tyler@tyler-ubuntu:~$ sudo deluser user03 --remove-home
+info: Looking for files to backup/remove ...
+info: Removing files ...
+info: Removing crontab ...
+info: Removing user `user03' ...
+tyler@tyler-ubuntu:~$ grep user03 /etc/passwd
+tyler@tyler-ubuntu:~$ ls /home
+tyler user01 user02
+Part 2:
+tyler@tyler-ubuntu:~$ sudo adduser user02
+info: Adding user `user02' ...
+info: Selecting UID/GID from range 1000 to 59999 ...
+info: Adding new group `user02' (1002) ...
+info: Adding new user `user02' (1002) with group `user02 (1002)' ...
+info: Creating home directory `/home/user02' ...
+info: Copying files from `/etc/skel' ...
+New password:
+Retype new password:
+passwd: password updated successfully
+Changing the user information for user02
+Enter the new value, or press ENTER for the default
+Full Name []: Tyler B
+Room Number []: 111
+Work Phone []: 112
+Home Phone []: 113
+Other []: other
+Is the information correct? [Y/n] y
+info: Adding new user `user02' to supplemental / extra groups `users' ...
+info: Adding user `user02' to group `users' ...
+tyler@tyler-ubuntu:~$ sudo adduser user03
+info: Adding user `user03' ...
+info: Selecting UID/GID from range 1000 to 59999 ...
+info: Adding new group `user03' (1003) ...
+info: Adding new user `user03' (1003) with group `user03 (1003)' ...
+info: Creating home directory `/home/user03' ...
+info: Copying files from `/etc/skel' ...
+New password:
+Retype new password:
+passwd: password updated successfully
+Changing the user information for user03
+Enter the new value, or press ENTER for the default
+Full Name []: tyler c
+Room Number []: 111
+Work Phone []: 112
+Home Phone []: 113
+Other []: other
+Is the information correct? [Y/n] y
+info: Adding new user `user03' to supplemental / extra groups `users' ...
+info: Adding user `user03' to group `users' ...
+tyler@tyler-ubuntu:~$ sudo deluser user03 --remove-home
+info: Looking for files to backup/remove ...
+info: Removing files ...
+info: Removing crontab ...
+info: Removing user `user03' ...
+tyler@tyler-ubuntu:~$ grep user03 /etc/passwd
+tyler@tyler-ubuntu:~$ ls /home
+tyler user01 user02
+tyler@tyler-ubuntu:~$ groups user01 user02
+user01 : user01 users
+user02 : user02 users
+tyler@tyler-ubuntu:~$ less /etc/group
+tyler@tyler-ubuntu:~$ sudo addgroup group1
+info: Selecting GID from range 1000 to 59999 ...
+info: Adding group `group1' (GID 1003) ...
+tyler@tyler-ubuntu:~$ grep group01 /etc/group
+tyler@tyler-ubuntu:~$ sudo nano /etc/group
+tyler@tyler-ubuntu:~$ grep group02 /etc/group
+tyler@tyler-ubuntu:~$ sudo adduser user01 group01
+fatal: The group `group01' does not exist.
+tyler@tyler-ubuntu:~$ sudo adduser user01 group1
+info: Adding user `user01' to group `group1' ...
+tyler@tyler-ubuntu:~$ sudo adduser user02 group1
+info: Adding user `user02' to group `group1' ...
+tyler@tyler-ubuntu:~$ groups user01 user02
+user01 : user01 users group1
+user02 : user02 users group1
+tyler@tyler-ubuntu:~$ grep group1 /etc/group
+group1:x:1003:user01,user02
+tyler@tyler-ubuntu:~$ sudo nano /etc/group
+tyler@tyler-ubuntu:~$ groups user01 user02
+user01 : user01 users group1
+user02 : user02 users
+tyler@tyler-ubuntu:~$ grep -E 'group1|group2' /etc/group
+group1:x:1003:user01
+group2:x:1004:
